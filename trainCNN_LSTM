@@ -1,0 +1,208 @@
+import re
+import numpy as np
+import tensorflow as tf
+import datetime
+from tensorflow.contrib import learn
+from text_cnn_lstm import TextCNN_LSTM
+from sklearn.model_selection import train_test_split
+from tensorflow.python.framework import graph_util
+import os
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+x_text = []
+y = []
+lines = list(open('./data/1.txt', 'r').readlines())
+print(len(lines))
+for line in lines:
+    line = line.encode('utf-8').decode('utf-8-sig')
+    a = line.split()
+    # print(a[1])
+    sentence = re.sub(r"(?<=\w)", " ", a[1]).strip()
+    x_text.append(sentence)
+    y.append(a[0])
+print(x_text[0:3])
+print(y[0:3])
+
+max_document_length = max([len(x.split(' ')) for x in x_text])
+print(max_document_length)
+vocab_processor = learn.preprocessing.VocabularyProcessor(max_document_length)
+x = np.array(list(vocab_processor.fit_transform(x_text)))
+# print(x[0:2])
+
+result = {}
+for i in set(y):
+    result[i] = y.count(i)
+all_label = list(result.keys())
+# print(result)
+# print(all_label)
+a = np.save('./resource/all_label.npy', np.array(all_label))
+# print(a)
+
+x0 = [[] * 1 for row in range(len(all_label))]
+y0 = [[] * 1 for row in range(len(all_label))]
+k = np.identity(len(all_label))
+# print(type(y[0]))
+# print(type(all_label[0]))
+
+for i in range(len(y)):
+    for j in range(len(all_label)):
+        if y[i] == all_label[j]:
+            y[i] = k[j]
+            x0[j].append(list(x[i]))
+            y0[j].append(list(y[i]))
+            break
+# print(len(x0[0]))
+# print(len(y0[0]))
+
+x_train = []
+y_train = []
+x_validation_test = []
+y_validation_test = []
+x_validation = []
+y_validation = []
+x_test = []
+y_test = []
+x_validation1 = []
+y_validation1 = []
+x_test1 = []
+y_test1 = []
+
+# 划分train/dev/test数据集
+for i1 in range(len(all_label)):
+    [x_train_split, x_validation_test_split, y_train_split, y__validation_test_split] = train_test_split(x0[i1], y0[i1], test_size=0.2)
+    x_train += x_train_split
+    y_train += y_train_split
+    x_validation_test.append(x_validation_test_split)
+    y_validation_test.append(y__validation_test_split)
+
+for i2 in range(len(all_label)):
+    [x_validation_split, x_test_split, y_validation_split, y_test_split] = train_test_split(x_validation_test[i2], y_validation_test[i2], test_size=0.5)
+    x_validation += x_validation_split
+    y_validation += y_validation_split
+    x_test += x_test_split
+    y_test += y_test_split
+    x_validation1.append(x_validation_split)
+    y_validation1.append(y_validation_split)
+    x_test1.append(x_test_split)
+    y_test1.append(y_test_split)
+
+print('Vocabulary Size: {:d}'.format(len(vocab_processor.vocabulary_)))
+print('Train/Dev split: {:d}/{:d}'.format(len(y_train), len(y_test)))
+print('')
+
+# 训练
+with tf.Session() as sess:
+    cnn_lstm = TextCNN_LSTM(
+        sequence_length=max_document_length,
+        num_classes=len(all_label),
+        vocab_size=len(vocab_processor.vocabulary_),
+        embedding_size=32,
+        filter_sizes=[3, 4, 5],
+        num_filters=128,
+        num_layers=1,
+        hidden_dim=128,
+        flag='textCNN'
+        # flag='textLSTM'
+    )
+
+    # 写入词汇表文件
+    vocab_processor.save('./resource/vocab')
+    # 定义训练相关操作
+    global_step = tf.Variable(0, name='global_step')
+    train_op = tf.train.AdamOptimizer().minimize(cnn_lstm.loss, global_step=global_step)
+    merged_summary_op = tf.summary.merge_all()
+    summary_writer = tf.summary.FileWriter('tmp/tensorflow_logs', graph=tf.get_default_graph())
+
+    # 初始化变量
+    sess.run(tf.global_variables_initializer())
+
+    def train_step(x_batch, y_batch):
+        """
+        一个训练步骤
+        """
+        feed_dict = {
+            cnn_lstm.input_x: x_batch,
+            cnn_lstm.input_y: y_batch,
+            cnn_lstm.dropout_keep_prob: 0.5
+        }
+        _, step, loss, accuracy, summary = sess.run([train_op, global_step, cnn_lstm.loss, cnn_lstm.accuracy, merged_summary_op], feed_dict)
+        summary_writer.add_summary(summary, step)
+        time_str = datetime.datetime.now().isoformat()
+        print('{}: step {}, loss {:g}, acc {:g}'.format(time_str, step, loss, accuracy))
+
+    def dev_test_step(x_batch, y_batch):
+        # 在开发集上验证模型
+        feed_dict = {
+            cnn_lstm.input_x: x_batch,
+            cnn_lstm.input_y: y_batch,
+            cnn_lstm.dropout_keep_prob: 1.0
+        }
+        step, loss, accuracy, prediction = sess.run([global_step, cnn_lstm.loss, cnn_lstm.accuracy, cnn_lstm.predictions], feed_dict)
+        time_str = datetime.datetime.now().isoformat()
+        print('{}: step {}, loss {:g}, acc {:g}'.format(time_str, step, loss, accuracy))
+        dev_test_result = [step, loss, accuracy, prediction]
+        return dev_test_result
+
+    def batch_iter(data, batch_size, num_epochs, shuffle=True):
+        # 生成一个batch迭代器
+        data = np.array(data)
+        data_size = len(data)
+        num_batches_per_epoch = int((data_size - 1) / batch_size) + 1
+        for epoch in range(num_epochs):
+            if shuffle:
+                shuffle_indices = np.random.permutation(np.arange(data_size))
+                shuffled_data = data[shuffle_indices]
+            else:
+                shuffled_data = data
+            for batch_num in range(num_batches_per_epoch):
+                start_idx = batch_num * batch_size
+                end_idx = min((batch_num + 1) * batch_size, data_size)
+                yield shuffled_data[start_idx:end_idx]
+            print(str((epoch+1)/num_epochs*100) + '%')
+
+    # 生成batches
+    batches = batch_iter(list(zip(x_train, y_train)), 2000, 1)
+
+    saver = tf.train.Saver(tf.global_variables())
+
+    # 迭代训练每个batch
+    for batch in batches:
+        x_batch, y_batch = zip(*batch)
+        train_step(x_batch, y_batch)
+
+        current_step = tf.train.global_step(sess, global_step)
+        if current_step % 100 == 0:
+            # saver.save(sess, './model/model')
+            constant_graph = graph_util.convert_variables_to_constants(sess, sess.graph_def, ['output/predictions'])
+            with tf.gfile.GFile('./resource/model.pb', mode='wb') as f:
+                f.write(constant_graph.SerializeToString())
+
+            print('\nEvaluation:')
+            dev_test_step(x_validation, y_validation)
+            for i3 in range(len(all_label)):
+                dev_test_step(x_validation1[i3], y_validation1[i3])
+            print('')
+
+    print(".......")
+    dev_test_result = dev_test_step(x_test, y_test)
+    for i4 in range(len(all_label)):
+        dev_test_step(x_test1[i4], y_test1[i4])
+        print('')
+
+    y_test_true = []
+    for i5 in range(len(y_test)):
+        y_test_true.append(all_label[y_test[i5].index(1)])
+    # print(y_test_true)
+
+    y_test_pre = []
+    for i6 in range(len(dev_test_result[3])):
+        y_test_pre.append(all_label[dev_test_result[3][i6]])
+    # print(y_test_pre)
+
+    sns.set()
+    C2 = confusion_matrix(y_test_true, y_test_pre, labels=all_label)
+    sns.heatmap(C2, annot=True)
+    plt.show()                   
